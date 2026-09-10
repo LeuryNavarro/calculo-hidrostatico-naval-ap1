@@ -952,7 +952,7 @@ def generate_vlcc_320k():
 # ==============================================================================
 # 3. MOTOR HIDROSTÁTICO (Itens 10 a 19 do Edital & Padrão SNU Term Project 2)
 # ==============================================================================
-def calculate_hydrostatics_at_draft(hull: Hull, T: float, rho: float = 1.025, t_keel: float = 0.017):
+def calculate_hydrostatics_at_draft(hull: Hull, T: float, rho: float = 1.025, t_keel: float = 0.017, compute_panels: bool = True):
     n_st = len(hull.stations_x)
     xs = hull.stations_x
     z_grid = np.linspace(hull.waterlines_z[0], T, 35)
@@ -970,33 +970,40 @@ def calculate_hydrostatics_at_draft(hull: Hull, T: float, rho: float = 1.025, t_
         half_mz, _ = integrate_dataset(z_grid, z_grid * y_vals, label_prefix=f"Z·y (ST {j:02d})")
         sec_mz[j] = 2.0 * half_mz
         
-        if len(y_vals) > 1 and dz > 0:
-            sec_girths[j] = 2.0 * np.sum(np.sqrt(dz**2 + np.diff(y_vals)**2))
-        else:
-            sec_girths[j] = 2.0 * y_vals[-1]
-
-    # Plano d'água no calado T
-    y_wp = np.array([hull.get_y(j, T) for j in range(n_st)])
-    half_awp, log_awp = integrate_dataset(xs, y_wp, label_prefix="Estações")
+        # Perímetro molhado seccional (girth)
+        y_pts = y_vals
+        dy = np.diff(y_pts)
+        dz_arr = np.diff(z_grid)
+        ds = np.sqrt(dy**2 + dz_arr**2)
+        sec_girths[j] = 2.0 * float(np.sum(ds))
+        
+    vol_long, log_vol_long = integrate_dataset(xs, sec_areas, label_prefix="Estações")
+    
+    # Validação Cruzada: Integração Vertical das Áreas de Linha d'Água Awp(z)
+    z_steps = np.linspace(hull.waterlines_z[0], T, 25)
+    awp_z = []
+    for wz in z_steps:
+        y_wl = np.array([hull.get_y(j, wz) for j in range(n_st)])
+        half_awp_z, _ = integrate_dataset(xs, y_wl, label_prefix="Estações")
+        awp_z.append(2.0 * half_awp_z)
+    
+    # Awp no Calado T
+    y_top = np.array([hull.get_y(j, T) for j in range(n_st)])
+    half_awp, log_awp = integrate_dataset(xs, y_top, label_prefix="Estações")
     awp = 2.0 * half_awp
     
-    int_x_2y, log_lcf = integrate_dataset(xs, xs * 2.0 * y_wp, label_prefix="Estações")
+    # Momentos da Linha d'Água no Calado T
+    int_x_2y, log_lcf = integrate_dataset(xs, xs * (2.0 * y_top), label_prefix="Estações")
     lcf = (int_x_2y / awp) if awp > 1e-6 else float(np.mean(xs))
     lcf_mid = lcf - (hull.LBP / 2.0)
     
-    it, log_it = integrate_dataset(xs, (2.0 / 3.0) * (y_wp ** 3), label_prefix="Estações")
-    il, log_il = integrate_dataset(xs, 2.0 * ((xs - lcf) ** 2) * y_wp, label_prefix="Estações")
+    # Inércia Transversal e Longitudinal
+    int_y3, log_it = integrate_dataset(xs, (y_top ** 3), label_prefix="Estações")
+    it = (2.0 / 3.0) * int_y3
     
-    # 1. Integração Longitudinal de Volume
-    vol_long, log_vol_long = integrate_dataset(xs, sec_areas, label_prefix="Estações")
+    int_x2_2y, log_il = integrate_dataset(xs, ((xs - lcf) ** 2) * (2.0 * y_top), label_prefix="Estações")
+    il = int_x2_2y
     
-    # 2. Integração Vertical de Volume (Dupla Validação SNU)
-    z_steps = np.linspace(hull.waterlines_z[0], T, 20)
-    awp_z = []
-    for zi in z_steps:
-        y_zi = np.array([hull.get_y(j, zi) for j in range(n_st)])
-        h_a, _ = integrate_dataset(xs, y_zi, label_prefix="Estações")
-        awp_z.append(2.0 * h_a)
     vol_vert, log_vol_vert = integrate_dataset(z_steps, np.array(awp_z), label_prefix="Z_WL")
     
     err_vol = abs(vol_long - vol_vert) / vol_long * 100.0 if vol_long > 1e-6 else 0.0
@@ -1028,9 +1035,13 @@ def calculate_hydrostatics_at_draft(hull: Hull, T: float, rho: float = 1.025, t_
     mtc = (displ_mld * bml) / (100.0 * hull.LBP) if hull.LBP > 0 else 0.0
     
     # Área Molhada (WSA)
-    wsa_panels, num_panels, mesh_res = calculate_wsa_panel_mesh(hull, T)
     wsa_girth, log_wsa = integrate_dataset(xs, sec_girths, label_prefix="Estações")
-    wsa = wsa_panels
+    if compute_panels:
+        wsa_panels, num_panels, mesh_res = calculate_wsa_panel_mesh(hull, T)
+        wsa = wsa_panels
+    else:
+        wsa_panels, num_panels, mesh_res = wsa_girth, 0, (0, 0)
+        wsa = wsa_girth
     
     # Coeficientes Adimensionais
     L, B = hull.LBP, hull.B
@@ -2410,25 +2421,401 @@ KMt = KB + BMt = {data_t['KB']:.3f} + {data_t['BMt']:.3f} = {data_t['KMt']:.3f} 
 
     # 5. HYDROSTATIC CURVES
     elif st.session_state.selected_module == "📈 Hydrostatic Curves":
-        st.subheader("📈 Hydrostatic Curves (Curvas Hidrostáticas)")
+        st.subheader("📈 Diagrama Oficial de Curvas Hidrostáticas (Hydrostatic Curves)")
+        st.caption("Diagrama completo das propriedades da carena traçadas contra o calado (Z = T), com réguas de escalas superiores e inferiores padronizadas e anotações diretas nas curvas.")
         
         curve_mode = st.radio(
             "Selecione o Formato do Diagrama:",
             [
+                "🏛️ Prancha Oficial de Curvas Hidrostáticas (Padrão Engenharia Naval / Estaleiro)",
                 "🌐 Diagrama Hidrostático Normalizado Internacional (Norma Seoul National University — Slide 9)",
                 "📊 Curvas Individuais Desmembradas (Grandezas Físicas Reais)"
             ],
             index=0
         )
         
-        drafts_range = np.arange(st.session_state.t_min, st.session_state.t_max + st.session_state.delta_t/2.0, st.session_state.delta_t)
-        table_records = [calculate_hydrostatics_at_draft(hull, t_val, st.session_state.density)[0] for t_val in drafts_range]
-        df_hydro_full = pd.DataFrame(table_records)
-        
-        if curve_mode.startswith("🌐"):
-            st.caption("Diagrama padronizado com equações de escala e offset oficiais da SNU (Slide 9 do Term Project 2).")
+        # ----------------------------------------------------------------------
+        # MODO 1: PRANCHA OFICIAL DE ENGENHARIA NAVAL (PADRÃO ESTALEIRO / UFRJ / IMO)
+        # ----------------------------------------------------------------------
+        if curve_mode.startswith("🏛️"):
+            col_ctrl1, col_ctrl2, col_ctrl3 = st.columns([2, 2, 2])
+            with col_ctrl1:
+                theme_choice = st.selectbox(
+                    "🎨 Estilo Visual da Prancha:",
+                    [
+                        "📄 Papel Branco Técnico (Oficial / Idêntico ao Modelo)",
+                        "🌌 Visualização Naval Moderna (Tema Escuro / Dark Mode)"
+                    ],
+                    index=0
+                )
+            with col_ctrl2:
+                num_steps = st.slider("Resolução da Curvatura (Pontos):", min_value=15, max_value=50, value=30, step=5)
+            with col_ctrl3:
+                line_style_choice = st.selectbox(
+                    "Traçado das Curvas:",
+                    ["📐 Clássico Monocromático Técnico", "🌈 Diferenciação por Cores Navais"],
+                    index=0
+                )
+
+            is_dark_theme = ("Escuro" in theme_choice)
+            color_mode = "multi" if "Cores" in line_style_choice else "mono"
             
-            # Escalas e Offsets Oficiais SNU (Slide 9 / Page 5)
+            # Geração ultra-rápida do lote de calados
+            drafts_range = np.linspace(st.session_state.t_min, st.session_state.t_max, num_steps)
+            with st.spinner("Traçando curvas hidrostáticas com alta precisão..."):
+                table_records = [
+                    calculate_hydrostatics_at_draft(hull, t_val, st.session_state.density, compute_panels=False)[0]
+                    for t_val in drafts_range
+                ]
+                df_hydro_sheet = pd.DataFrame(table_records)
+
+            # Função de Formatação Numérica Naval
+            def fmt_nav(val):
+                if abs(val) >= 1000:
+                    return f"{val:,.0f}".replace(",", ".")
+                elif abs(val) >= 10:
+                    return f"{val:.0f}"
+                elif abs(val) == 0:
+                    return "0"
+                else:
+                    return f"{val:.1f}".replace(".", ",")
+
+            def nice_ceil(val):
+                if val <= 0:
+                    return 1.0
+                exp = np.floor(np.log10(val))
+                base = 10 ** exp
+                s = val / base
+                if s <= 1.0: return 1.0 * base
+                elif s <= 1.5: return 1.5 * base
+                elif s <= 2.0: return 2.0 * base
+                elif s <= 2.5: return 2.5 * base
+                elif s <= 3.0: return 3.0 * base
+                elif s <= 5.0: return 5.0 * base
+                elif s <= 7.5: return 7.5 * base
+                else: return 10.0 * base
+
+            # Cálculo dos limites das Réguas
+            vol_max = nice_ceil(df_hydro_sheet["Volume_mld"].max())
+            disp_max = nice_ceil(df_hydro_sheet["Displacement_mld"].max())
+            kmt_max = nice_ceil(df_hydro_sheet["KMt"].max())
+            kml_max = nice_ceil(df_hydro_sheet["KMl"].max())
+            
+            l_dev = max(
+                abs(df_hydro_sheet["LCB_mid"].min()), abs(df_hydro_sheet["LCB_mid"].max()),
+                abs(df_hydro_sheet["LCF_mid"].min()), abs(df_hydro_sheet["LCF_mid"].max()), 1.0
+            )
+            l_bound = float(np.ceil(l_dev / 2.0) * 2.0)
+            if l_bound < 4.0:
+                l_bound = 6.0 # Padrão canônico 6m de Meia-Nau
+
+            mtc_max = nice_ceil(df_hydro_sheet["MTC"].max())
+            tpc_max = nice_ceil(df_hydro_sheet["TPC"].max())
+
+            # Mapeamento Horizontal Normalizado no Intervalo [0, 1]
+            ts = df_hydro_sheet["T"].values
+            D_max = float(hull.D)
+            Td = float(hull.Td)
+
+            x_vol = df_hydro_sheet["Volume_mld"] / vol_max
+            x_disp = df_hydro_sheet["Displacement_mld"] / disp_max
+            x_kb = df_hydro_sheet["KB"] / kmt_max
+            x_bmt = df_hydro_sheet["BMt"] / kmt_max
+            x_kmt = df_hydro_sheet["KMt"] / kmt_max
+            x_bml = df_hydro_sheet["BMl"] / kml_max
+            x_kml = df_hydro_sheet["KMl"] / kml_max
+            x_lcb = 0.5 + (df_hydro_sheet["LCB_mid"] / (2.0 * l_bound))
+            x_lcf = 0.5 + (df_hydro_sheet["LCF_mid"] / (2.0 * l_bound))
+            x_tpc = df_hydro_sheet["TPC"] / tpc_max
+            x_mtc = df_hydro_sheet["MTC"] / mtc_max
+            x_cb = df_hydro_sheet["CB"] * 0.46
+            x_cm = df_hydro_sheet["CM"] * 0.46
+            x_cp = 0.54 + df_hydro_sheet["CP"] * 0.46
+            x_cwp = 0.54 + df_hydro_sheet["CWP"] * 0.46
+
+            # Paleta de Cores do Tema
+            bg_col = "#0b132b" if is_dark_theme else "#ffffff"
+            fg_col = "#f8fafc" if is_dark_theme else "#111827"
+            grid_col = "#1e293b" if is_dark_theme else "#e2e8f0"
+            border_col = "#64748b" if is_dark_theme else "#111827"
+            default_line_col = "#93c5fd" if is_dark_theme else "#1e293b"
+
+            # Especificações de cada Curva
+            palette_map = {
+                "Volume": "#0ea5e9" if color_mode == "multi" else default_line_col,
+                "Deslocamento": "#2563eb" if color_mode == "multi" else default_line_col,
+                "KB": "#10b981" if color_mode == "multi" else default_line_col,
+                "BM_T": "#f59e0b" if color_mode == "multi" else default_line_col,
+                "KM_T": "#ef4444" if color_mode == "multi" else default_line_col,
+                "BM_L": "#d946ef" if color_mode == "multi" else default_line_col,
+                "KM_L": "#8b5cf6" if color_mode == "multi" else default_line_col,
+                "LCB": "#06b6d4" if color_mode == "multi" else default_line_col,
+                "LCF": "#14b8a6" if color_mode == "multi" else default_line_col,
+                "TPC": "#f97316" if color_mode == "multi" else default_line_col,
+                "MTC": "#84cc16" if color_mode == "multi" else default_line_col,
+                "Cb": "#64748b" if color_mode == "multi" else default_line_col,
+                "Cm": "#475569" if color_mode == "multi" else default_line_col,
+                "Cp": "#334155" if color_mode == "multi" else default_line_col,
+                "Cwp": "#1e293b" if color_mode == "multi" else default_line_col,
+            }
+
+            curves_def = [
+                {"name": "Volume (∇)", "x": x_vol, "label": "Volume", "unit": "m³", "real": df_hydro_sheet["Volume_mld"], "dash": "solid", "lw": 2.0},
+                {"name": "Deslocamento (Δ)", "x": x_disp, "label": "Deslocamento", "unit": "t", "real": df_hydro_sheet["Displacement_mld"], "dash": "solid", "lw": 2.0},
+                {"name": "KB", "x": x_kb, "label": "KB", "unit": "m", "real": df_hydro_sheet["KB"], "dash": "solid", "lw": 1.7},
+                {"name": "BMt", "x": x_bmt, "label": "BM_T", "unit": "m", "real": df_hydro_sheet["BMt"], "dash": "dot", "lw": 1.6},
+                {"name": "KMt", "x": x_kmt, "label": "KM_T", "unit": "m", "real": df_hydro_sheet["KMt"], "dash": "solid", "lw": 2.0},
+                {"name": "BMl", "x": x_bml, "label": "BM_L", "unit": "m", "real": df_hydro_sheet["BMl"], "dash": "dash", "lw": 1.6},
+                {"name": "KMl", "x": x_kml, "label": "KM_L", "unit": "m", "real": df_hydro_sheet["KMl"], "dash": "solid", "lw": 2.0},
+                {"name": "LCB (From MS)", "x": x_lcb, "label": "LCB", "unit": "m", "real": df_hydro_sheet["LCB_mid"], "dash": "solid", "lw": 1.7},
+                {"name": "LCF (From MS)", "x": x_lcf, "label": "LCF", "unit": "m", "real": df_hydro_sheet["LCF_mid"], "dash": "solid", "lw": 1.7},
+                {"name": "TPC", "x": x_tpc, "label": "TPC", "unit": "t/cm", "real": df_hydro_sheet["TPC"], "dash": "solid", "lw": 1.7},
+                {"name": "MTC", "x": x_mtc, "label": "MTC", "unit": "t·m/cm", "real": df_hydro_sheet["MTC"], "dash": "solid", "lw": 1.7},
+                {"name": "Cb", "x": x_cb, "label": "Cb", "unit": "", "real": df_hydro_sheet["CB"], "dash": "solid", "lw": 1.7},
+                {"name": "Cm", "x": x_cm, "label": "Cm", "unit": "", "real": df_hydro_sheet["CM"], "dash": "solid", "lw": 1.7},
+                {"name": "Cp", "x": x_cp, "label": "Cp", "unit": "", "real": df_hydro_sheet["CP"], "dash": "solid", "lw": 1.7},
+                {"name": "Cwp", "x": x_cwp, "label": "Cwp", "unit": "", "real": df_hydro_sheet["CWP"], "dash": "solid", "lw": 1.7},
+            ]
+
+            fig_sheet = go.Figure()
+
+            # Adiciona cada curva no gráfico central
+            for item in curves_def:
+                custom_data = np.stack((item["real"], ts), axis=-1)
+                fig_sheet.add_trace(go.Scatter(
+                    x=item["x"], y=ts, mode="lines",
+                    name=item["name"],
+                    customdata=custom_data,
+                    hovertemplate=f"<b>{item['name']}</b><br>Valor Real: %{{customdata[0]:.2f}} {item['unit']}<br>Calado: %{{customdata[1]:.2f}} m<extra></extra>",
+                    line=dict(color=palette_map[item["label"]], width=item["lw"], dash=item["dash"])
+                ))
+
+            shapes = []
+            annotations = []
+
+            # Linha de Calado de Projeto Td (Azul tracejada com símbolos navais)
+            shapes.append(dict(
+                type="line", xref="x", yref="y",
+                x0=0.0, x1=1.0, y0=Td, y1=Td,
+                line=dict(color="#2563eb", width=1.6, dash="dash")
+            ))
+            annotations.append(dict(x=-0.012, y=Td, xref="x", yref="y", text=f"<b>{Td:.2f}</b>", showarrow=False, xanchor="right", font=dict(color="#2563eb", size=11, family="Helvetica")))
+            annotations.append(dict(x=-0.004, y=Td, xref="x", yref="y", text="<b>⊤</b>", showarrow=False, xanchor="center", font=dict(color="#2563eb", size=15)))
+            annotations.append(dict(x=1.004, y=Td, xref="x", yref="y", text="<b>⊤</b>", showarrow=False, xanchor="center", font=dict(color="#2563eb", size=15)))
+            annotations.append(dict(x=1.012, y=Td, xref="x", yref="y", text=f"<b>{Td:.2f}</b>", showarrow=False, xanchor="left", font=dict(color="#2563eb", size=11, family="Helvetica")))
+
+            # Rótulos de Texto Diretos nas Curvas
+            label_pos_ratio = {
+                "Volume": 0.52, "Deslocamento": 0.48, "KM_T": 0.72, "BM_T": 0.70, "KB": 0.75,
+                "KM_L": 0.70, "BM_L": 0.72, "LCB": 0.60, "LCF": 0.55, "TPC": 0.50, "MTC": 0.54,
+                "Cb": 0.48, "Cm": 0.48, "Cp": 0.50, "Cwp": 0.48
+            }
+
+            for item in curves_def:
+                lbl = item["label"]
+                ratio = label_pos_ratio.get(lbl, 0.5)
+                idx_pt = int(np.clip(len(ts) * ratio, 0, len(ts) - 1))
+                pt_x = float(item["x"].iloc[idx_pt])
+                pt_y = float(ts[idx_pt])
+                annotations.append(dict(
+                    x=pt_x, y=pt_y, xref="x", yref="y",
+                    text=f"<b>{lbl}</b>",
+                    showarrow=False,
+                    font=dict(color=fg_col, size=9.5, family="Helvetica"),
+                    bgcolor=bg_col,
+                    bordercolor=grid_col,
+                    borderwidth=0.5,
+                    borderpad=2
+                ))
+
+            # ------------------------------------------------------------------
+            # RÉGUAS DE GRADUAÇÃO SUPERIORES E INFERIORES
+            # ------------------------------------------------------------------
+            top_rulers = [
+                {"title": "LCB e LCF (m - From MS)", "range": [-l_bound, l_bound], "n_div": 4},
+                {"title": "MT - 1 (t-m/cm)", "range": [0, mtc_max], "n_div": 5},
+                {"title": "TPC (t/cm)", "range": [0, tpc_max], "n_div": 5},
+                {"title": "C_B e C_M  |  C_P e C_WP", "range": [0, 1], "n_div": 2}
+            ]
+
+            bottom_rulers = [
+                {"title": "DESLOCAMENTO (t)", "range": [0, disp_max], "n_div": 5},
+                {"title": "VOLUME (m³)", "range": [0, vol_max], "n_div": 5},
+                {"title": "KB, BM_T e KM_T (m)", "range": [0, kmt_max], "n_div": 5},
+                {"title": "BM_L e KM_L (m)", "range": [0, kml_max], "n_div": 5}
+            ]
+
+            def draw_ruler(y_b, y_t, r_info, is_split=False):
+                # Caixa retangular da régua
+                shapes.append(dict(
+                    type="rect", xref="paper", yref="paper",
+                    x0=0.0, x1=1.0, y0=y_b, y1=y_t,
+                    line=dict(color=border_col, width=1.2), fillcolor=bg_col
+                ))
+                if not is_split:
+                    # Título da régua
+                    annotations.append(dict(
+                        x=0.5, y=y_t - 0.016, xref="paper", yref="paper",
+                        text=f"<b>{r_info['title']}</b>",
+                        showarrow=False, xanchor="center", yanchor="middle",
+                        font=dict(color=fg_col, size=10, family="Helvetica")
+                    ))
+                    # Ticks e valores
+                    n_d = r_info["n_div"]
+                    v_arr = np.linspace(r_info["range"][0], r_info["range"][1], n_d + 1)
+                    for i, val in enumerate(v_arr):
+                        xp = i / float(n_d)
+                        shapes.append(dict(
+                            type="line", xref="paper", yref="paper",
+                            x0=xp, x1=xp, y0=y_b, y1=y_b + 0.018,
+                            line=dict(color=border_col, width=1.0)
+                        ))
+                        annotations.append(dict(
+                            x=xp, y=y_b - 0.013, xref="paper", yref="paper",
+                            text=fmt_nav(val), showarrow=False, xanchor="center", yanchor="top",
+                            font=dict(color=fg_col, size=9, family="Helvetica")
+                        ))
+                else:
+                    # Régua bipartida: CB/CM e CP/CWP
+                    shapes.append(dict(
+                        type="line", xref="paper", yref="paper",
+                        x0=0.5, x1=0.5, y0=y_b, y1=y_t,
+                        line=dict(color=border_col, width=1.0)
+                    ))
+                    annotations.append(dict(
+                        x=0.25, y=y_t - 0.016, xref="paper", yref="paper",
+                        text="<b>C_B e C_M</b>", showarrow=False, xanchor="center", yanchor="middle",
+                        font=dict(color=fg_col, size=9.5, family="Helvetica")
+                    ))
+                    annotations.append(dict(
+                        x=0.75, y=y_t - 0.016, xref="paper", yref="paper",
+                        text="<b>C_P e C_WP</b>", showarrow=False, xanchor="center", yanchor="middle",
+                        font=dict(color=fg_col, size=9.5, family="Helvetica")
+                    ))
+                    for frac, txt in [(0.0, "0"), (0.23, "0,5"), (0.46, "1")]:
+                        shapes.append(dict(
+                            type="line", xref="paper", yref="paper",
+                            x0=frac, x1=frac, y0=y_b, y1=y_b + 0.018,
+                            line=dict(color=border_col, width=1.0)
+                        ))
+                        annotations.append(dict(
+                            x=frac, y=y_b - 0.013, xref="paper", yref="paper",
+                            text=txt, showarrow=False, xanchor="center", yanchor="top",
+                            font=dict(color=fg_col, size=9, family="Helvetica")
+                        ))
+                    for frac, txt in [(0.54, "0"), (0.77, "0,5"), (1.0, "1")]:
+                        shapes.append(dict(
+                            type="line", xref="paper", yref="paper",
+                            x0=frac, x1=frac, y0=y_b, y1=y_b + 0.018,
+                            line=dict(color=border_col, width=1.0)
+                        ))
+                        annotations.append(dict(
+                            x=frac, y=y_b - 0.013, xref="paper", yref="paper",
+                            text=txt, showarrow=False, xanchor="center", yanchor="top",
+                            font=dict(color=fg_col, size=9, family="Helvetica")
+                        ))
+
+            # Renderiza as 4 réguas superiores
+            draw_ruler(0.95, 0.995, top_rulers[0])
+            draw_ruler(0.89, 0.935, top_rulers[1])
+            draw_ruler(0.83, 0.875, top_rulers[2])
+            draw_ruler(0.77, 0.815, top_rulers[3], is_split=True)
+
+            # Renderiza as 4 réguas inferiores
+            draw_ruler(0.18, 0.225, bottom_rulers[0])
+            draw_ruler(0.12, 0.165, bottom_rulers[1])
+            draw_ruler(0.06, 0.105, bottom_rulers[2])
+            draw_ruler(0.00, 0.045, bottom_rulers[3])
+
+            fig_sheet.update_layout(
+                plot_bgcolor=bg_col,
+                paper_bgcolor=bg_col,
+                shapes=shapes,
+                annotations=annotations,
+                showlegend=False,
+                height=950,
+                margin=dict(l=85, r=85, t=40, b=40),
+                xaxis=dict(
+                    domain=[0.0, 1.0],
+                    range=[0.0, 1.0],
+                    showgrid=True, gridcolor=grid_col, gridwidth=0.8,
+                    zeroline=False, showticklabels=False,
+                    linecolor=border_col, linewidth=1.5, mirror=True
+                ),
+                yaxis=dict(
+                    domain=[0.24, 0.75],
+                    range=[0.0, D_max],
+                    title=dict(text="<b>CALADO (m)</b>", font=dict(size=12, color=fg_col, family="Helvetica")),
+                    showgrid=True, gridcolor=grid_col, gridwidth=0.8,
+                    zeroline=False, linecolor=border_col, linewidth=1.5,
+                    tickmode="array",
+                    tickvals=[0.0, D_max / 2.0, Td, D_max],
+                    ticktext=[f"0,00", f"{D_max/2.0:.2f}".replace(".", ","), f"{Td:.2f}".replace(".", ","), f"{D_max:.2f}".replace(".", ",")],
+                    tickfont=dict(size=11, color=fg_col, family="Helvetica")
+                ),
+                yaxis2=dict(
+                    domain=[0.24, 0.75],
+                    range=[0.0, D_max],
+                    title=dict(text="<b>CALADO (m)</b>", font=dict(size=12, color=fg_col, family="Helvetica")),
+                    overlaying="y", side="right",
+                    showgrid=False, linecolor=border_col, linewidth=1.5,
+                    tickmode="array",
+                    tickvals=[0.0, D_max / 2.0, Td, D_max],
+                    ticktext=[f"0,00", f"{D_max/2.0:.2f}".replace(".", ","), f"{Td:.2f}".replace(".", ","), f"{D_max:.2f}".replace(".", ",")],
+                    tickfont=dict(size=11, color=fg_col, family="Helvetica")
+                )
+            )
+
+            st.plotly_chart(fig_sheet, use_container_width=True)
+
+            # ------------------------------------------------------------------
+            # PAINEL RESUMO DAS GRANDEZAS FÍSICAS NO CALADO DE PROJETO
+            # ------------------------------------------------------------------
+            st.divider()
+            st.markdown(f"#### ⚓ Resumo Técnico no Calado de Projeto ($T_d = {Td:.2f}\\text{{ m}}$):")
+            
+            # Dados no Calado de Projeto
+            data_td, _, _ = calculate_hydrostatics_at_draft(hull, Td, st.session_state.density, compute_panels=False)
+            
+            col_m1, col_m2, col_m3, col_m4, col_m5 = st.columns(5)
+            col_m1.metric("Volume Moldado (∇)", f"{data_td['Volume_mld']:,.1f} m³")
+            col_m2.metric("Deslocamento (Δ)", f"{data_td['Displacement_mld']:,.1f} t")
+            col_m3.metric("KM Transversal (KMt)", f"{data_td['KMt']:.2f} m")
+            col_m4.metric("KM Longitudinal (KMl)", f"{data_td['KMl']:.1f} m")
+            col_m5.metric("Centro Carena (LCB)", f"{data_td['LCB_mid']:+.2f} m")
+
+            col_m6, col_m7, col_m8, col_m9, col_m10 = st.columns(5)
+            col_m6.metric("Flutuação (LCF)", f"{data_td['LCF_mid']:+.2f} m")
+            col_m7.metric("Imersão (TPC)", f"{data_td['TPC']:.2f} t/cm")
+            col_m8.metric("Trim (MTC)", f"{data_td['MTC']:.1f} t·m/cm")
+            col_m9.metric("Coef. Bloco (Cb)", f"{data_td['CB']:.3f}")
+            col_m10.metric("Coef. Seção Mestra (Cm)", f"{data_td['CM']:.3f}")
+
+            with st.expander("📖 Guia de Engenharia: Como Interpretar a Folha de Curvas Hidrostáticas"):
+                st.markdown("""
+                A **Prancha de Curvas Hidrostáticas** é o documento canônico fornecido pelo estaleiro para operações de carregamento, cálculo de trim e estabilidade:
+                * **Eixo Vertical:** Representa o **Calado do Navio ($T$)**, desde a Linha de Base ($Z = 0$) até o Pontal ($Z = D$). O Calado de Projeto ($T_d$) está destacado pela linha tracejada azul com a marcação de disco d'água $\\top$.
+                * **Réguas Superiores:**
+                  1. **LCB e LCF (From MS):** Posição longitudinal dos centros de carena e de flutuação em relação à Meia-Nau ($0 = \\text{SM}$). Valores à esquerda são para Ré (Popa) e à direita para Vante (Proa).
+                  2. **MT - 1 (t-m/cm):** Momento necessário para alterar o trim da embarcação em exatamente 1 cm.
+                  3. **TPC (t/cm):** Peso em toneladas necessário para submergir a embarcação em 1 cm adicional.
+                  4. **CB e CM / CP e CWP:** Coeficientes adimensionais de finura e plano de água na escala de $0$ a $1$.
+                * **Réguas Inferiores:**
+                  1. **DESLOCAMENTO (t):** Massa total deslocada do navio na densidade da água adotada.
+                  2. **VOLUME (m³):** Volume submerso da carena (obras vivas).
+                  3. **KB, BMT e KMT (m):** Parâmetros fundamentais de estabilidade transversal.
+                  4. **BML e KML (m):** Parâmetros de rigidez e estabilidade longitudinal.
+                """)
+
+        # ----------------------------------------------------------------------
+        # MODO 2: DIAGRAMA NORMALIZADO INTERNACIONAL (NORMA SNU)
+        # ----------------------------------------------------------------------
+        elif curve_mode.startswith("🌐"):
+            st.caption("Diagrama padronizado com equações de escala e offset oficiais da SNU (Slide 9 do Term Project 2).")
+            drafts_range = np.arange(st.session_state.t_min, st.session_state.t_max + st.session_state.delta_t/2.0, st.session_state.delta_t)
+            table_records = [calculate_hydrostatics_at_draft(hull, t_val, st.session_state.density, compute_panels=False)[0] for t_val in drafts_range]
+            df_hydro_full = pd.DataFrame(table_records)
+            
             snu_curves = [
                 {"name": "KMt [1:1] + 10", "x": df_hydro_full["KMt"] * 1.0 + 10.0, "color": "#f43f5e"},
                 {"name": "KMl [1:50] + 35", "x": df_hydro_full["KMl"] / 50.0 + 35.0, "color": "#c084fc"},
@@ -2459,7 +2846,15 @@ KMt = KB + BMt = {data_t['KB']:.3f} + {data_t['BMt']:.3f} = {data_t['KMt']:.3f} 
                 legend=dict(orientation="h", yanchor="bottom", y=-0.32, xanchor="center", x=0.5)
             )
             st.plotly_chart(fig_snu, use_container_width=True)
+
+        # ----------------------------------------------------------------------
+        # MODO 3: CURVAS INDIVIDUAIS DESMEMBRADAS (GRANDEZAS FÍSICAS REAIS)
+        # ----------------------------------------------------------------------
         else:
+            drafts_range = np.arange(st.session_state.t_min, st.session_state.t_max + st.session_state.delta_t/2.0, st.session_state.delta_t)
+            table_records = [calculate_hydrostatics_at_draft(hull, t_val, st.session_state.density, compute_panels=False)[0] for t_val in drafts_range]
+            df_hydro_full = pd.DataFrame(table_records)
+
             fig_comb = go.Figure()
             curves_dict = {
                 "Volume ∇ (m³)": "Volume_mld",
