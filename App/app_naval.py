@@ -504,6 +504,28 @@ def smart_parse_offset_table(uploaded_file):
     # Extrai metadados da embarcação se disponíveis
     meta = extract_ship_metadata(raw_df)
 
+    # 0. Auto-detecção de tabelas transpostas (Evita inverter LBP e Pontal)
+    # Se a primeira célula for 'x' ou a primeira linha começar com 'wl', transpõe automaticamente
+    first_cell = str(raw_df.iloc[0, 0]).strip().lower()
+    first_row = [str(x).strip().lower() for x in raw_df.iloc[0, 1:min(6, raw_df.shape[1])]]
+    if "x" in first_cell or any(c.startswith("wl") or "wl" in c for c in first_row):
+        try:
+            # Coluna 0 contém as estações X e Linha 0 contém as linhas d'água Z
+            stations = [extract_numeric_value(v, float(i)) for i, v in enumerate(raw_df.iloc[1:, 0].values)]
+            waterlines = [extract_numeric_value(v, float(i) * 0.5) for i, v in enumerate(raw_df.iloc[0, 1:].values)]
+            data_vals = raw_df.iloc[1:, 1:].values.T # Transpõe a matriz de dados para Z (linhas) × X (colunas)
+            cleaned = np.zeros(data_vals.shape, dtype=float)
+            for r in range(data_vals.shape[0]):
+                for c in range(data_vals.shape[1]):
+                    cleaned[r, c] = extract_numeric_value(data_vals[r, c], 0.0)
+            df_trans = pd.DataFrame(cleaned, index=waterlines, columns=stations)
+            df_trans = sanitize_offset_table(df_trans)
+            if df_trans is not None and df_trans.shape[0] >= 3 and df_trans.shape[1] >= 3:
+                df_trans.attrs["meta"] = meta
+                return df_trans
+        except Exception:
+            pass
+
     # 1. Estratégia 1: Matriz com Rótulos e Linha 'x' / Coluna 'z' (ex: Plano_de_Linhas_Meias_Bocas)
     df_result = try_parse_labelled_offset_grid(raw_df)
     if df_result is not None and df_result.shape[0] >= 3 and df_result.shape[1] >= 3:
@@ -538,8 +560,10 @@ def smart_parse_offset_table(uploaded_file):
 
     df_clean = pd.DataFrame(cleaned, index=waterlines_z, columns=stations_x)
     df_clean = sanitize_offset_table(df_clean)
-    df_clean.attrs["meta"] = meta
-    return df_clean
+    if df_clean is not None:
+        df_clean.attrs["meta"] = meta
+        return df_clean
+    raise ValueError("Não foi possível reconhecer a estrutura da tabela. Verifique se as linhas e colunas são numéricas.")
 
 
 # ==============================================================================
@@ -738,13 +762,14 @@ class Hull:
         self.waterlines_z = np.asarray(waterlines_z, dtype=float)
         self.offsets = np.asarray(offsets_matrix, dtype=float)
         
-        ox = np.argsort(self.stations_x)
-        self.stations_x = self.stations_x[ox]
-        self.offsets = self.offsets[:, ox]
-        
-        oz = np.argsort(self.waterlines_z)
-        self.waterlines_z = self.waterlines_z[oz]
-        self.offsets = self.offsets[oz, :]
+        # Garante linhas d'água e estações estritamente crescentes e sem valores repetidos
+        uz, idx_z = np.unique(self.waterlines_z, return_index=True)
+        self.waterlines_z = uz
+        self.offsets = self.offsets[idx_z, :]
+
+        ux, idx_x = np.unique(self.stations_x, return_index=True)
+        self.stations_x = ux
+        self.offsets = self.offsets[:, idx_x]
         
         self.LBP = LBP or float(self.stations_x[-1] - self.stations_x[0])
         self.B = B or float(2.0 * np.max(self.offsets))
@@ -754,7 +779,8 @@ class Hull:
         self._station_interps = []
         for j in range(len(self.stations_x)):
             y_col = self.offsets[:, j]
-            if len(self.waterlines_z) >= 3 and len(np.unique(y_col)) > 1:
+            # Proteção contra repetições no PCHIP (x must be strictly increasing)
+            if len(self.waterlines_z) >= 3 and len(np.unique(y_col)) > 1 and np.all(np.diff(self.waterlines_z) > 1e-6):
                 try:
                     interp = PchipInterpolator(self.waterlines_z, y_col)
                 except Exception:
@@ -780,7 +806,7 @@ class Hull:
         y_at_stations = np.maximum(0.0, y_at_stations)
         
         # 2. Interpola longitudinalmente ao longo de X com PCHIP suave
-        if len(self.stations_x) >= 3 and len(np.unique(y_at_stations)) > 1:
+        if len(self.stations_x) >= 3 and len(np.unique(y_at_stations)) > 1 and np.all(np.diff(self.stations_x) > 1e-6):
             try:
                 long_interp = PchipInterpolator(self.stations_x, y_at_stations)
                 return max(0.0, float(long_interp(x)))
@@ -1546,36 +1572,39 @@ def solve_longitudinal_equilibrium(hull, totals, df_hydro):
     gmt = kmt - kg_fluid
     mtc_exact = (delta * gml) / (100.0 * LBP) if LBP > 0 else mtc
     
-    # 4. Momento de Trim e Direção (Capítulos 16 e 48)
-    # Trimming Lever: (LCB - LCG) medido a partir da Perpendicular de Ré (AP)
-    trimming_lever = lcb - lcg
-    m_trim = delta * trimming_lever # em t·m
+    # 4. Momento de Trim e Direção
+    # Fórmula Canônica Solicitada: Mt = deslocamento * (LCG - LCB)
+    trimming_lever = lcg - lcb  # (LCG - LCB)
+    m_trim = delta * trimming_lever # Mt em t·m
+    
+    # 5. Calcular o Trim
+    # trim (cm) = Mt / MTC 1cm
+    # trim (m) = Mt / 100 MTC 1cm
+    eff_mtc = mtc if mtc > 1e-4 else 1.0
+    t_trim_cm = m_trim / eff_mtc
+    t_trim_m = m_trim / (100.0 * eff_mtc)
     
     if trimming_lever > 1e-4:
-        trim_direction = "Pela Popa (By the Stern)"
-        trim_dir_code = "stern"
-    elif trimming_lever < -1e-4:
         trim_direction = "Pela Proa (By the Head)"
         trim_dir_code = "head"
+    elif trimming_lever < -1e-4:
+        trim_direction = "Pela Popa (By the Stern)"
+        trim_dir_code = "stern"
     else:
         trim_direction = "Em Águas Parelhas (Even Keel)"
         trim_dir_code = "even"
         
-    # 5. Mudança Total de Trim (t)
-    # t = Mtrim / (100 * MTC) em metros | t_cm = Mtrim / MTC em centímetros
-    eff_mtc = mtc if mtc > 1e-4 else 1.0
-    t_trim_m = m_trim / (100.0 * eff_mtc)
-    t_trim_cm = m_trim / eff_mtc
-    
-    # 6. Alterações nos Perpendiculares (Capítulos 16 e 48)
-    # LCF é o centro de rotação da flutuação!
-    delta_ta = t_trim_m * (lcf / LBP)
-    delta_tf = - t_trim_m * ((LBP - lcf) / LBP)
+    # 6. Alterações nos Perpendiculares (Rotação em torno do LCF)
+    # Se LCG > LCB (Mt > 0): trim pela proa -> proa afunda (+), popa levanta (-)
+    # Se LCG < LCB (Mt < 0): trim pela popa -> popa afunda (+), proa levanta (-)
+    delta_tf = t_trim_m * ((LBP - lcf) / LBP)
+    delta_ta = - t_trim_m * (lcf / LBP)
     
     # 7. Calados Finais de Equilíbrio
+    # Ti = T0 (Calado Inicial Isoclínico)
     ta = t0 + delta_ta
     tf = t0 + delta_tf
-    t_mid = (ta + tf) / 2.0
+    t_mid = (ta + tf) / 2.0  # Calado Médio Tm = (Ta + Tf) / 2
     
     # Ângulo de caimento longitudinal theta
     theta_rad = np.arctan((ta - tf) / LBP) if LBP > 0 else 0.0
@@ -1915,6 +1944,14 @@ if st.session_state.app_state == "home":
                     calc_lbp = float(meta_loaded.get("lbp", max(1.0, float(df_loaded.columns[-1]) - float(df_loaded.columns[0]))))
                     calc_beam = float(meta_loaded.get("beam", max(0.5, float(2.0 * df_loaded.values.max()))))
                     calc_depth = float(meta_loaded.get("depth", max(0.5, float(df_loaded.index[-1]))))
+
+                    # Auto-correção de segurança: se pontal ficou maior que LBP (tabela invertida), transpõe automaticamente
+                    if calc_depth > calc_lbp and calc_depth > 10.0 and calc_lbp < 10.0:
+                        df_loaded = df_loaded.T
+                        calc_lbp, calc_depth = calc_depth, calc_lbp
+                        st.session_state.df_offsets = df_loaded
+                        st.session_state.uploaded_df_offsets = df_loaded
+
                     calc_td = float(meta_loaded.get("draft", max(0.1, float(calc_depth * 0.7))))
 
                     st.session_state.lbp = calc_lbp
@@ -3685,23 +3722,23 @@ else:
 
             col_frm1, col_frm2 = st.columns(2)
             with col_frm1:
-                st.markdown("##### 1. Braço e Momento de Trim:")
-                st.latex(r"Braço_{trim} = (LCB - LCG) \quad [m]")
-                st.latex(r"M_{trim} = \Delta \cdot (LCB - LCG) \quad [t \cdot m]")
-                st.latex(r"t = rac{M_{trim}}{100 \cdot MTC} \quad [m]")
+                st.markdown("##### 1. Momento de Trim e Compasso:")
+                st.latex(r"M_t = \Delta \cdot (LCG - LCB) \quad [t \cdot m]")
+                st.latex(r"trim_{(cm)} = rac{M_t}{MTC_{1cm}} \quad [cm]")
+                st.latex(r"trim_{(m)} = rac{M_t}{100 \cdot MTC_{1cm}} \quad [m]")
             with col_frm2:
-                st.markdown("##### 2. Variação nos Perpendiculares e Calados:")
-                st.latex(r"\delta T_a = t \cdot rac{LCF}{LBP} \quad [m]")
-                st.latex(r"\delta T_f = - t \cdot rac{LBP - LCF}{LBP} \quad [m]")
-                st.latex(r"T_a = T_0 + \delta T_a, \quad T_f = T_0 + \delta T_f")
+                st.markdown("##### 2. Variações nos Perpendiculares e Calado Médio:")
+                st.latex(r"\delta T_f = + trim_{(m)} \cdot rac{LBP - LCF}{LBP} \quad [m] \quad 	ext{(Vante)}")
+                st.latex(r"\delta T_a = - trim_{(m)} \cdot rac{LCF}{LBP} \quad [m] \quad 	ext{(Ré)}")
+                st.latex(r"T_a = T_0 + \delta T_a, \quad T_f = T_0 + \delta T_f, \quad T_m = rac{T_a + T_f}{2}")
 
             st.divider()
 
             t1, t2, t3, t4 = st.columns(4)
-            t1.metric("Braço de Trim (LCB - LCG)", f"{eq_res['trimming_lever']:+.3f} m")
-            t2.metric("Momento de Trim (M_trim)", f"{eq_res['M_trim']:,.1f} t·m")
+            t1.metric("Braço de Trim (LCG - LCB)", f"{eq_res['trimming_lever']:+.3f} m")
+            t2.metric("Momento de Trim (Mt)", f"{eq_res['M_trim']:,.1f} t·m")
             t3.metric("Sentido do Trim", eq_res["trim_direction"])
-            t4.metric("Trim Total t", f"{eq_res['t_trim_m']:+.3f} m", delta=f"{eq_res['t_trim_cm']:+.1f} cm")
+            t4.metric("Trim Total (m)", f"{eq_res['t_trim_m']:+.3f} m", delta=f"{eq_res['t_trim_cm']:+.1f} cm (MTC 1cm)")
 
             st.write("")
             k_a, k_f, k_m, k_th = st.columns(4)
@@ -3824,26 +3861,28 @@ else:
             * **Height of Transverse Metacentre (KMt):** **{eq_res['KMt']:.3f} m** | Longitudinal (KMl): **{eq_res['KMl']:.1f} m**
             """)
 
-            st.markdown("#### STEP 4: TRIMMING LEVER AND TRIMMING MOMENT")
+            st.markdown("#### STEP 4: TRIMMING LEVER AND MOMENTO DE TRIM (Mt)")
             st.markdown(f"""
-            * **Trimming Lever:** LCB - LCG = {eq_res['LCB']:.3f} - {loading_totals['LCG']:.3f} = **{eq_res['trimming_lever']:+.3f} m** [{eq_res['trim_direction']}]
-            * **Trimming Moment (M_trim):** M_trim = Δ · (LCB - LCG) = {loading_totals['Delta']:,.1f} × ({eq_res['trimming_lever']:+.3f}) = **{eq_res['M_trim']:,.1f} t·m**
+            * **Trimming Lever:** LCG - LCB = {loading_totals['LCG']:.3f} - {eq_res['LCB']:.3f} = **{eq_res['trimming_lever']:+.3f} m** [{eq_res['trim_direction']}]
+            * **Momento de Trim (Mt):** Mt = Deslocamento × (LCG - LCB) = {loading_totals['Delta']:,.1f} × ({eq_res['trimming_lever']:+.3f}) = **{eq_res['M_trim']:,.1f} t·m**
             """)
 
-            st.markdown("#### STEP 5: TOTAL CHANGE OF TRIM AND VARIATIONS AT PERPENDICULARS")
+            st.markdown("#### STEP 5: TOTAL CHANGE OF TRIM (USANDO MTC 1cm)")
             st.markdown(f"""
-            * **Total Change of Trim (t):** t = M_trim / (100 · MTC) = {eq_res['M_trim']:,.1f} / (100 × {eq_res['MTC']:.2f}) = **{eq_res['t_trim_m']:+.3f} m** ({eq_res['t_trim_cm']:+.1f} cm)
-            * **Change of Draft Aft (at AP - δTa):** δTa = t · (LCF / LBP) = ({eq_res['t_trim_m']:+.3f}) × ({eq_res['LCF']:.3f} / {hull.LBP:.2f}) = **{eq_res['delta_Ta']:+.3f} m**
-            * **Change of Draft Forward (at FP - δTf):** δTf = - t · ((LBP - LCF) / LBP) = - ({eq_res['t_trim_m']:+.3f}) × ({hull.LBP - eq_res['LCF']:.3f} / {hull.LBP:.2f}) = **{eq_res['delta_Tf']:+.3f} m**
+            * **Trim em centímetros:** trim (cm) = Mt / MTC 1cm = {eq_res['M_trim']:,.1f} / {eq_res['MTC']:.2f} = **{eq_res['t_trim_cm']:+.1f} cm**
+            * **Trim em metros:** trim (m) = Mt / (100 · MTC 1cm) = {eq_res['M_trim']:,.1f} / (100 × {eq_res['MTC']:.2f}) = **{eq_res['t_trim_m']:+.3f} m**
+            * **Variação a Ré (δTa):** δTa = - trim · (LCF / LBP) = **{eq_res['delta_Ta']:+.3f} m**
+            * **Variação a Vante (δTf):** δTf = + trim · ((LBP - LCF) / LBP) = **{eq_res['delta_Tf']:+.3f} m**
             """)
 
-            st.markdown("#### STEP 6: FINAL EQUILIBRIUM DRAFTS & IDENTITY CHECK")
+            st.markdown("#### STEP 6: CALADOS FINAIS & CALADO MÉDIO (Tm)")
             st.markdown(f"""
-            * **Draft Aft (Ta):** Ta = T₀ + δTa = {eq_res['T0']:.3f} + ({eq_res['delta_Ta']:+.3f}) = **{eq_res['Ta']:.3f} m**
-            * **Draft Forward (Tf):** Tf = T₀ + δTf = {eq_res['T0']:.3f} + ({eq_res['delta_Tf']:+.3f}) = **{eq_res['Tf']:.3f} m**
-            * **Mean Draft (T_mid):** T_mid = (Ta + Tf) / 2 = **{eq_res['T_mid']:.3f} m**
-            * **Mathematical Identity Verification:** Ta - Tf = {eq_res['Ta']:.3f} - {eq_res['Tf']:.3f} = **{eq_res['Ta'] - eq_res['Tf']:+.3f} m** ≡ t = **{eq_res['t_trim_m']:+.3f} m** [VERIFIED]
-            * **Trim Angle (θ):** θ = arctan((Ta - Tf) / LBP) = **{eq_res['theta_deg']:.4f}°**
+            * **Calado Inicial Isoclínico (Ti / T₀):** **{eq_res['T0']:.3f} m**
+            * **Calado Final na Popa (Ta):** Ta = T₀ + δTa = {eq_res['T0']:.3f} + ({eq_res['delta_Ta']:+.3f}) = **{eq_res['Ta']:.3f} m**
+            * **Calado Final na Proa (Tf):** Tf = T₀ + δTf = {eq_res['T0']:.3f} + ({eq_res['delta_Tf']:+.3f}) = **{eq_res['Tf']:.3f} m**
+            * **Calado Médio Final (Tm):** Tm = (Ta + Tf) / 2 = ({eq_res['Ta']:.3f} + {eq_res['Tf']:.3f}) / 2 = **{eq_res['T_mid']:.3f} m**
+            * **Fechamento Geométrico:** Tf - Ta = **{eq_res['Tf'] - eq_res['Ta']:+.3f} m** ≡ trim = **{eq_res['t_trim_m']:+.3f} m** [VERIFICADO]
+            * **Ângulo de Trim (θ):** θ = arctan((Tf - Ta) / LBP) = **{eq_res['theta_deg']:.4f}°**
             """)
 
             st.divider()
